@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.36631.11
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RESTORER", "RESTORER\RESTORER.csproj", "{617A42B7-C156-4466-A73B-A837238378A3}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{617A42B7-C156-4466-A73B-A837238378A3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{617A42B7-C156-4466-A73B-A837238378A3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{617A42B7-C156-4466-A73B-A837238378A3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{617A42B7-C156-4466-A73B-A837238378A3}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DBAED6D1-AD47-4FC8-A5A6-AF4CF496208B}
+	EndGlobalSection
+EndGlobal
