@@ -45,7 +45,10 @@ namespace RESTORER.Controller
                 throw new DirectoryNotFoundException(
                     string.Format("Backup directory not found: {0}", BackupDirectory));
 
+            // BAGO:
             foreach (string filePath in Directory.GetFiles(BackupDirectory, "*.7z"))
+                files.Add(filePath);
+            foreach (string filePath in Directory.GetFiles(BackupDirectory, "*.rar"))
                 files.Add(filePath);
 
             return files;
@@ -131,7 +134,7 @@ namespace RESTORER.Controller
                             string fileName = Path.GetFileNameWithoutExtension(
                                 parts[parts.Length - 1]);
                             if (!string.IsNullOrWhiteSpace(fileName))
-                                databases.Add(fileName);
+                                databases.Add(fileName); // original pa rin, hindi pa tri-trim
                         }
                     }
                 }
@@ -144,9 +147,10 @@ namespace RESTORER.Controller
         // RESTORE SELECTED SCHEMAS
         //
         // Naming convention inside .7z:
-        //   zip filename : roxas_2026_05_08.7z  → branch = "roxas"
-        //   sql entry    : sofos2_foroxas_roxas  → trim "_roxas" → "sofos2_foroxas"
-        //   schemaVar    : "_sofos2_foroxas"     → must match selectedSchemas
+        //   zip filename : roxas_2026_05_08.7z      → branch = "roxas"
+        //   sql entry    : sofos2_foroxas_roxas.sql  → trim branch → "sofos2_foroxas"
+        //   sql entry    : sofos2_cmtinga_2026_05_11 → trim date lang → "sofos2_cmtinga"
+        //   schemaVar    : "_sofos2_foroxas" / "_sofos2_cmtinga" → must match selectedSchemas
         // ────────────────────────────────────────────────────
         public RestoreResult RestoreSelected(
             string sourceZipPath,
@@ -182,7 +186,7 @@ namespace RESTORER.Controller
             {
                 bool hasMatch = zipEntries.Exists(entry =>
                 {
-                    string schemaVar = "_" + TrimBranchSuffix(entry, branchName);
+                    string schemaVar = "_" + ResolveSchemaName(entry, branchName);
                     return string.Equals(schemaVar, selected, StringComparison.OrdinalIgnoreCase);
                 });
 
@@ -192,33 +196,30 @@ namespace RESTORER.Controller
 
             foreach (string zipEntry in zipEntries)
             {
-                // ── Step 1: Trim branch suffix ──
-                // "sofos2_foroxas_roxas" + branch="roxas" → "sofos2_foroxas"
-                // "sofos2_roxas"         + branch="roxas" → "sofos2"
-                // "yuu_roxas"            + branch="roxas" → "yuu"
-                // DATI:
-                string trimmedName = TrimBranchSuffix(zipEntry, branchName);
-                string schemaVar = trimmedName;          // walang _ prefix — ito ang actual DB name
-                string schemaVarWithPrefix = "_" + trimmedName; // para sa matching sa checkedListBox
+                // ── Step 1: Resolve schema name ──
+                // Convention A: sofos2_cmtinga_2026_05_11 → may date → trim date lang → "sofos2_cmtinga"
+                // Convention B: sofos2_foroxas_roxas       → walang date → trim branch → "sofos2_foroxas"
+                string trimmedName = ResolveSchemaName(zipEntry, branchName);
+                string schemaVar = trimmedName;
+                string schemaVarWithPrefix = "_" + trimmedName;
 
-                // ── Step 3: Exact match — is this schema selected by the user? ──
-                // BAGO:
-                bool isSelected = selectedSchemas.Exists(s =>
+                // ── Step 2: Exact match — is this schema selected by the user? ──
+                string matchedSchema = selectedSchemas.Find(s =>
                     string.Equals(s, schemaVarWithPrefix, StringComparison.OrdinalIgnoreCase));
 
+                bool isSelected = matchedSchema != null;
                 if (!isSelected)
                 {
                     progressCallback?.Invoke(string.Format(
                         "Skipped: {0}  (schema {1} not selected)",
-                        zipEntry, schemaVar));
-                    result.Skipped.Add(schemaVar);
+                        zipEntry, schemaVarWithPrefix));
+                    result.Skipped.Add(schemaVarWithPrefix);
                     continue;
                 }
 
-                // ── Step 4: Restore — target schema is exactly schemaVar ──
                 progressCallback?.Invoke(string.Format(
                     "Restoring: {0}  →  target schema: {1} ...",
-                    zipEntry, schemaVar));
+                    zipEntry, schemaVarWithPrefix));
 
                 string tempFolder = Path.Combine(
                     @"C:\Temp\MySQLRestore",
@@ -227,21 +228,22 @@ namespace RESTORER.Controller
 
                 try
                 {
+                    // ← original zipEntry (with date) para matamaan ang tamang file sa zip
                     string extractArgs = string.Format(
                         "e \"{0}\" -o\"{1}\" \"-p{2}\" \"{3}.sql\" -y",
                         sourceZipPath, tempFolder, plainPassword, zipEntry);
 
                     RunProcess(_config.SevenZipPath, extractArgs, "7-Zip extraction failed");
 
+                    // ← original zipEntry din para sa path ng extracted file
                     string sqlFile = Path.Combine(tempFolder, zipEntry + ".sql");
                     if (!File.Exists(sqlFile))
                         throw new FileNotFoundException(string.Format(
                             "Could not find {0}.sql inside the archive.", zipEntry));
 
-                    _config.Database = trimmedName; // walang _ — ito ang actual MySQL schema name
+                    _config.Database = matchedSchema;
                     RestoreDatabase(sqlFile);
 
-                    // ── Log: success ──
                     LogService.LogSuccess(zipFileName, schemaVar);
                     result.Restored.Add(schemaVar);
                 }
@@ -262,6 +264,26 @@ namespace RESTORER.Controller
             }
 
             return result;
+        }
+
+        // ────────────────────────────────────────────────────
+        // PRIVATE: RESOLVE SCHEMA NAME FROM ZIP ENTRY
+        // Convention A: may date suffix sa SQL → trim date lang
+        //   "sofos2_cmtinga_2026_05_11" → "sofos2_cmtinga"
+        // Convention B: walang date, may branch suffix → trim branch
+        //   "sofos2_foroxas_roxas" → "sofos2_foroxas"
+        // ────────────────────────────────────────────────────
+        private static string ResolveSchemaName(string zipEntry, string branchName)
+        {
+            string dateTrimmed = TrimDateSuffix(zipEntry);
+
+            // Kung nagbago after TrimDateSuffix → may date ang SQL filename
+            // → date lang ang na-trim, huwag nang i-TrimBranchSuffix
+            if (!string.Equals(dateTrimmed, zipEntry, StringComparison.OrdinalIgnoreCase))
+                return dateTrimmed;
+
+            // Kung hindi nagbago → walang date → i-trim ang branch suffix (dati convention)
+            return TrimBranchSuffix(zipEntry, branchName);
         }
 
         // ────────────────────────────────────────────────────
