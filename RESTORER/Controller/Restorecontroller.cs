@@ -19,6 +19,9 @@ namespace RESTORER.Controller
 
     public class RestoreController
     {
+        // ── The fixed backup directory ──
+        private const string BackupDirectory = @"D:\backup";
+
         private readonly DatabaseConfig _config;
         private readonly ACryptoServiceProvider _crypto;
 
@@ -31,7 +34,26 @@ namespace RESTORER.Controller
 
         public DatabaseConfig GetConfig() => _config;
 
-        // ── GET ALL SCHEMAS FROM MySQL SERVER ──
+        // ────────────────────────────────────────────────────
+        // GET ALL .7z FILES IN D:\backup
+        // ────────────────────────────────────────────────────
+        public List<string> GetBackupZipFiles()
+        {
+            var files = new List<string>();
+
+            if (!Directory.Exists(BackupDirectory))
+                throw new DirectoryNotFoundException(
+                    string.Format("Backup directory not found: {0}", BackupDirectory));
+
+            foreach (string filePath in Directory.GetFiles(BackupDirectory, "*.7z"))
+                files.Add(filePath);
+
+            return files;
+        }
+
+        // ────────────────────────────────────────────────────
+        // GET ALL SCHEMAS FROM MySQL SERVER
+        // ────────────────────────────────────────────────────
         public List<string> GetServerDatabases()
         {
             var databases = new List<string>();
@@ -61,7 +83,10 @@ namespace RESTORER.Controller
             return databases;
         }
 
-        // ── GET SCHEMAS INSIDE A ZIP ──
+        // ────────────────────────────────────────────────────
+        // GET SQL ENTRY NAMES INSIDE A ZIP
+        // Returns base file names WITHOUT .sql extension
+        // ────────────────────────────────────────────────────
         public List<string> GetDatabasesFromZip(string zipPath)
         {
             string plainPassword = GetPlainZipPassword();
@@ -115,7 +140,14 @@ namespace RESTORER.Controller
             return databases;
         }
 
-        // ── RESTORE SELECTED SCHEMAS ──
+        // ────────────────────────────────────────────────────
+        // RESTORE SELECTED SCHEMAS
+        //
+        // Naming convention inside .7z:
+        //   zip filename : roxas_2026_05_08.7z  → branch = "roxas"
+        //   sql entry    : sofos2_foroxas_roxas  → trim "_roxas" → "sofos2_foroxas"
+        //   schemaVar    : "_sofos2_foroxas"     → must match selectedSchemas
+        // ────────────────────────────────────────────────────
         public RestoreResult RestoreSelected(
             string sourceZipPath,
             List<string> selectedSchemas,
@@ -127,28 +159,66 @@ namespace RESTORER.Controller
                 throw new ArgumentException("Source path cannot be empty.");
             if (!File.Exists(sourceZipPath))
                 throw new FileNotFoundException("Backup file not found.", sourceZipPath);
-            if (selectedSchemas == null || selectedSchemas.Count == 0)
-                throw new Exception("No schemas selected for restore.");
-
             string plainPassword = GetPlainZipPassword();
+            string zipFileName = Path.GetFileName(sourceZipPath);
 
+            // ── Log: no target schema selected ──
+            if (selectedSchemas == null || selectedSchemas.Count == 0)
+            {
+                LogService.LogNoTargetSchema(zipFileName);
+                throw new Exception("No schemas selected for restore.");
+            }
+
+            // ── Derive branch name from the .7z filename ──
+            // "roxas_2026_05_08.7z" → TrimDateSuffix("roxas_2026_05_08") → "roxas"
+            string zipBaseName = Path.GetFileNameWithoutExtension(sourceZipPath);
+            string branchName = TrimDateSuffix(zipBaseName);
+
+            // Read what SQL files are inside the chosen .7z once
             List<string> zipEntries = GetDatabasesFromZip(sourceZipPath);
 
-            foreach (string schemaName in selectedSchemas)
+            // ── Log: selected schemas that have no matching file in the .7z ──
+            foreach (string selected in selectedSchemas)
             {
-                string matchedEntry = zipEntries.Find(z =>
-                    z.Equals(schemaName, StringComparison.OrdinalIgnoreCase) ||
-                    z.StartsWith(schemaName + "_", StringComparison.OrdinalIgnoreCase)
-                );
-
-                if (matchedEntry == null)
+                bool hasMatch = zipEntries.Exists(entry =>
                 {
-                    result.Skipped.Add(schemaName);
-                    LogService.LogFailure(schemaName, "Schema not found in backup file");
+                    string schemaVar = "_" + TrimBranchSuffix(entry, branchName);
+                    return string.Equals(schemaVar, selected, StringComparison.OrdinalIgnoreCase);
+                });
+
+                if (!hasMatch)
+                    LogService.LogNoBackupProvided(zipFileName, selected);
+            }
+
+            foreach (string zipEntry in zipEntries)
+            {
+                // ── Step 1: Trim branch suffix ──
+                // "sofos2_foroxas_roxas" + branch="roxas" → "sofos2_foroxas"
+                // "sofos2_roxas"         + branch="roxas" → "sofos2"
+                // "yuu_roxas"            + branch="roxas" → "yuu"
+                // DATI:
+                string trimmedName = TrimBranchSuffix(zipEntry, branchName);
+                string schemaVar = trimmedName;          // walang _ prefix — ito ang actual DB name
+                string schemaVarWithPrefix = "_" + trimmedName; // para sa matching sa checkedListBox
+
+                // ── Step 3: Exact match — is this schema selected by the user? ──
+                // BAGO:
+                bool isSelected = selectedSchemas.Exists(s =>
+                    string.Equals(s, schemaVarWithPrefix, StringComparison.OrdinalIgnoreCase));
+
+                if (!isSelected)
+                {
+                    progressCallback?.Invoke(string.Format(
+                        "Skipped: {0}  (schema {1} not selected)",
+                        zipEntry, schemaVar));
+                    result.Skipped.Add(schemaVar);
                     continue;
                 }
 
-                progressCallback?.Invoke(string.Format("Restoring: {0} ...", schemaName));
+                // ── Step 4: Restore — target schema is exactly schemaVar ──
+                progressCallback?.Invoke(string.Format(
+                    "Restoring: {0}  →  target schema: {1} ...",
+                    zipEntry, schemaVar));
 
                 string tempFolder = Path.Combine(
                     @"C:\Temp\MySQLRestore",
@@ -157,28 +227,27 @@ namespace RESTORER.Controller
 
                 try
                 {
-                    string sevenZipGui = Path.Combine(
-                    Path.GetDirectoryName(_config.SevenZipPath), "7zG.exe");
-
                     string extractArgs = string.Format(
-                        "e \"{0}\" -o\"{1}\" \"-p{2}\" \"{3}.sql\"",
-                        sourceZipPath, tempFolder, plainPassword, matchedEntry);
+                        "e \"{0}\" -o\"{1}\" \"-p{2}\" \"{3}.sql\" -y",
+                        sourceZipPath, tempFolder, plainPassword, zipEntry);
 
-                    RunProcessGui(sevenZipGui, extractArgs, "7-Zip extraction failed");
+                    RunProcess(_config.SevenZipPath, extractArgs, "7-Zip extraction failed");
 
-                    string sqlFile = Path.Combine(tempFolder, matchedEntry + ".sql");
+                    string sqlFile = Path.Combine(tempFolder, zipEntry + ".sql");
                     if (!File.Exists(sqlFile))
                         throw new FileNotFoundException(string.Format(
-                            "Could not find {0}.sql inside the archive.", matchedEntry));
+                            "Could not find {0}.sql inside the archive.", zipEntry));
 
-                    _config.Database = schemaName;
+                    _config.Database = trimmedName; // walang _ — ito ang actual MySQL schema name
                     RestoreDatabase(sqlFile);
 
-                    result.Restored.Add(schemaName);
+                    // ── Log: success ──
+                    LogService.LogSuccess(zipFileName, schemaVar);
+                    result.Restored.Add(schemaVar);
                 }
                 catch (Exception ex)
                 {
-                    LogService.LogFailure(schemaName, ex.Message);
+                    LogService.LogFailure(schemaVar, ex.Message);
                     throw;
                 }
                 finally
@@ -194,8 +263,10 @@ namespace RESTORER.Controller
 
             return result;
         }
-        // ── PRIVATE: RUN 7zG WITH VISIBLE GUI PROGRESS WINDOW ──
-        // ── PRIVATE: RUN 7zG WITH VISIBLE GUI PROGRESS WINDOW ──
+
+        // ────────────────────────────────────────────────────
+        // PRIVATE: RUN 7zG WITH VISIBLE GUI PROGRESS WINDOW
+        // ────────────────────────────────────────────────────
         private static void RunProcessGui(string exe, string args, string errorMsg)
         {
             var psi = new ProcessStartInfo
@@ -211,7 +282,6 @@ namespace RESTORER.Controller
             {
                 process.Start();
 
-                // Give the window time to appear then bring it to front
                 System.Threading.Thread.Sleep(500);
 
                 try
@@ -219,7 +289,7 @@ namespace RESTORER.Controller
                     process.WaitForInputIdle(2000);
                     if (process.MainWindowHandle != IntPtr.Zero)
                     {
-                        ShowWindow(process.MainWindowHandle, 9);   // SW_RESTORE
+                        ShowWindow(process.MainWindowHandle, 9);
                         SetForegroundWindow(process.MainWindowHandle);
                     }
                 }
@@ -233,14 +303,15 @@ namespace RESTORER.Controller
             }
         }
 
-        // ── Win32 imports to bring 7zG window to front ──
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
-        // ── PRIVATE: DECRYPT ZIP PASSWORD FROM App.config ──
+        // ────────────────────────────────────────────────────
+        // PRIVATE: DECRYPT ZIP PASSWORD FROM App.config
+        // ────────────────────────────────────────────────────
         private string GetPlainZipPassword()
         {
             string encryptedPassword =
@@ -253,7 +324,9 @@ namespace RESTORER.Controller
             return _crypto.Decrypt(encryptedPassword, "pullasciiencrypt");
         }
 
-        // ── PRIVATE: RESTORE ONE SQL FILE INTO _config.Database ──
+        // ────────────────────────────────────────────────────
+        // PRIVATE: RESTORE ONE SQL FILE INTO _config.Database
+        // ────────────────────────────────────────────────────
         private void RestoreDatabase(string sqlFilePath)
         {
             string connStr = string.Format(
@@ -263,6 +336,12 @@ namespace RESTORER.Controller
             using (var conn = new MySqlConnection(connStr))
             {
                 conn.Open();
+
+                using (var cmd = new MySqlCommand("SET GLOBAL max_allowed_packet=536870912;", conn))
+                {
+                    try { cmd.ExecuteNonQuery(); } catch { }
+                }
+
                 using (var cmd = new MySqlCommand(
                     string.Format(
                         "CREATE DATABASE IF NOT EXISTS `{0}`;", _config.Database), conn))
@@ -272,7 +351,6 @@ namespace RESTORER.Controller
             string cleanSqlPath = sqlFilePath + ".clean.sql";
             try
             {
-                // Strip USE statements so data always lands in the correct schema
                 using (var reader = new StreamReader(sqlFilePath, Encoding.UTF8))
                 using (var writer = new StreamWriter(cleanSqlPath, false, Encoding.UTF8))
                 {
@@ -287,7 +365,10 @@ namespace RESTORER.Controller
                 }
 
                 string args = string.Format(
-                    "--host={0} --port={1} --user={2} --password={3} {4}",
+                    "--host={0} --port={1} --user={2} --password={3}" +
+                    " --max_allowed_packet=512M" +
+                    " --connect_timeout=3600" +
+                    " {4}",
                     _config.Server, _config.Port, _config.UserId,
                     _config.Password, _config.Database);
 
@@ -305,13 +386,27 @@ namespace RESTORER.Controller
                 {
                     process.Start();
 
-                    using (var fileStream = new FileStream(
-                        cleanSqlPath, FileMode.Open, FileAccess.Read))
+                    var stdinTask = System.Threading.Tasks.Task.Run(() =>
                     {
-                        fileStream.CopyTo(process.StandardInput.BaseStream);
-                    }
-                    process.StandardInput.BaseStream.Flush();
-                    process.StandardInput.Close();
+                        try
+                        {
+                            using (var fileStream = new FileStream(
+                                cleanSqlPath,
+                                FileMode.Open,
+                                FileAccess.Read,
+                                FileShare.Read,
+                                bufferSize: 4 * 1024 * 1024))
+                            {
+                                fileStream.CopyTo(process.StandardInput.BaseStream);
+                            }
+                        }
+                        finally
+                        {
+                            try { process.StandardInput.Close(); } catch { }
+                        }
+                    });
+
+                    stdinTask.Wait();
                     process.WaitForExit();
 
                     string error = process.StandardError.ReadToEnd();
@@ -331,7 +426,9 @@ namespace RESTORER.Controller
             }
         }
 
-        // ── PRIVATE: RUN ANY EXTERNAL PROCESS ──
+        // ────────────────────────────────────────────────────
+        // PRIVATE: RUN ANY EXTERNAL PROCESS (silent)
+        // ────────────────────────────────────────────────────
         private static void RunProcess(string exe, string args, string errorMsg)
         {
             var psi = new ProcessStartInfo
@@ -358,9 +455,47 @@ namespace RESTORER.Controller
             }
         }
 
-        private static string EscapeForShell(string input)
+        // ────────────────────────────────────────────────────
+        // PRIVATE: TRIM DATE SUFFIX
+        // "roxas_2026_05_08" → "roxas"
+        // Walks backwards and drops consecutive all-digit segments.
+        // ────────────────────────────────────────────────────
+        private static string TrimDateSuffix(string entryName)
         {
-            return input.Replace("\"", "\\\"");
+            string[] parts = entryName.Split('_');
+            int cutIndex = parts.Length;
+
+            for (int i = parts.Length - 1; i >= 0; i--)
+            {
+                bool allDigits = true;
+                foreach (char c in parts[i])
+                    if (!char.IsDigit(c)) { allDigits = false; break; }
+
+                if (allDigits && parts[i].Length > 0)
+                    cutIndex = i;
+                else
+                    break;
+            }
+
+            return string.Join("_", parts, 0, cutIndex);
+        }
+
+        // ────────────────────────────────────────────────────
+        // PRIVATE: TRIM BRANCH SUFFIX FROM SQL ENTRY NAME
+        // branch = derived from .7z filename (e.g. "roxas")
+        // "sofos2_foroxas_roxas" → "sofos2_foroxas"
+        // "sofos2_roxas"         → "sofos2"
+        // "yuu_roxas"            → "yuu"
+        // ────────────────────────────────────────────────────
+        private static string TrimBranchSuffix(string entryName, string branchName)
+        {
+            if (string.IsNullOrWhiteSpace(branchName)) return entryName;
+
+            string suffix = "_" + branchName;
+            if (entryName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return entryName.Substring(0, entryName.Length - suffix.Length);
+
+            return entryName;
         }
     }
 }
